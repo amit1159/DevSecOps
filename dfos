@@ -1,0 +1,1407 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'QA_BASE_URL',
+            defaultValue: 'https://qa.dfos.co/app',
+            description: 'DFOS QA application URL'
+        )
+        choice(
+            name: 'SBOM_GATE_SEVERITY',
+            choices: ['CRITICAL', 'HIGH,CRITICAL'],
+            description: 'SBOM security gate: severities that trip the gate'
+        )
+        choice(
+            name: 'SBOM_GATE_MODE',
+            choices: ['warn', 'block'],
+            description: 'warn = build marked UNSTABLE, block = build marked FAILURE when the gate trips'
+        )
+    }
+
+    environment {
+        SCANNER_HOME = tool 'sonarscanner'
+        REPORT_DIR = "/var/www/html/devsecops-reports/${BUILD_NUMBER}"
+        ZAP_HOME = '/opt/zaproxy'
+        ZAP_PORT = '8091'
+        TRIVY_BIN = '/usr/bin/trivy'
+        SYFT_BIN = '/usr/bin/syft'
+        SBOM_NAME = 'dfos-qa-server'
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
+        timeout(time: 90, unit: 'MINUTES')
+    }
+
+    stages {
+
+        // --------------------------------------------------
+        // 1. GIT CHECKOUT
+        // --------------------------------------------------
+        stage('Git Checkout') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'dfos',
+                    url: 'https://github.com/nrvdesignxdfos/qa-server.git'
+            }
+        }
+
+        // --------------------------------------------------
+        // 2. PREPARE AND VALIDATE
+        // --------------------------------------------------
+        stage('Prepare Reports & Validate') {
+            steps {
+                sh '''
+                    set -eu
+
+                    mkdir -p "$REPORT_DIR"
+                    test -d /var/www/html/devsecops-reports
+                    test -w "$REPORT_DIR" || {
+                        echo "Jenkins cannot write to $REPORT_DIR. Grant the Jenkins runtime user write access to /var/www/html/devsecops-reports."
+                        exit 1
+                    }
+
+                    echo "Build: $BUILD_NUMBER" > "$REPORT_DIR/build-info.txt"
+                    echo "Commit: $(git rev-parse HEAD)" >> "$REPORT_DIR/build-info.txt"
+                    echo "QA URL: $QA_BASE_URL" >> "$REPORT_DIR/build-info.txt"
+
+                    # Authorized QA target validation
+                    case "$QA_BASE_URL" in
+                        https://qa.dfos.co/app|https://qa.dfos.co/app/|http://qa.dfos.co/app|http://qa.dfos.co/app/)
+                            ;;
+                        *)
+                            echo "Unauthorized QA target. Scan aborted."
+                            exit 1
+                            ;;
+                    esac
+
+                    # Verify installed tools
+                    command -v gitleaks
+                    command -v semgrep
+                    semgrep --version
+                    command -v python3
+                    command -v ss
+                    command -v "$TRIVY_BIN"
+                    "$TRIVY_BIN" --version | head -n 1
+                    command -v "$SYFT_BIN"
+                    "$SYFT_BIN" version | head -n 1
+
+                    test -x "$SCANNER_HOME/bin/sonar-scanner"
+                    test -x "$ZAP_HOME/zap.sh"
+
+                    # Check ZAP port
+                    if ss -lnt | grep -q ":${ZAP_PORT} "; then
+                        echo "ZAP port ${ZAP_PORT} is already in use."
+                        exit 1
+                    fi
+
+                    echo "All required tools verified."
+                    echo "ZAP port ${ZAP_PORT} is available."
+
+                    # Generate ZAP Automation Framework plan (Traditional + Firefox Headless + Pen Test)
+                    cat > "$REPORT_DIR/zap-plan.yaml" <<EOF
+env:
+  contexts:
+    - name: DFOS-QA
+      urls:
+        - "$QA_BASE_URL"
+      includePaths:
+        - "${QA_BASE_URL}.*"
+
+jobs:
+  - type: spider
+    parameters:
+      context: DFOS-QA
+      maxDuration: 10
+      maxDepth: 5
+
+  - type: spiderAjax
+    parameters:
+      context: DFOS-QA
+      browserId: firefox-headless
+      maxDuration: 10
+      inScopeOnly: true
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 5
+
+  - type: activeScan
+    parameters:
+      context: DFOS-QA
+      policy: "Pen Test"
+      maxRuleDurationInMins: 5
+      maxScanDurationInMins: 30
+
+  - type: report
+    parameters:
+      template: traditional-json
+      reportDir: "$REPORT_DIR"
+      reportFile: zap-dast-report.json
+      reportTitle: DFOS QA DAST Report
+      reportDescription: DFOS QA Full Automated Pen Test Scan
+
+  - type: report
+    parameters:
+      template: traditional-html
+      reportDir: "$REPORT_DIR"
+      reportFile: zap-dast-report.html
+      reportTitle: DFOS QA DAST Report
+      reportDescription: DFOS QA Full Automated Pen Test Scan
+EOF
+
+                    echo "ZAP Automation Framework plan generated in $REPORT_DIR."
+                '''
+            }
+        }
+
+        // --------------------------------------------------
+        // 3. FULL PARALLEL SECURITY SCANNING
+        // --------------------------------------------------
+        stage('Parallel Security Scanning') {
+            parallel {
+
+                // 1. GITLEAKS
+                stage('Gitleaks - Secret Scanning') {
+                    steps {
+                        sh '''
+                            set +e
+
+                            gitleaks detect \
+                                --source . \
+                                --report-format json \
+                                --report-path "$REPORT_DIR/gitleaks-report.json" \
+                                --redact \
+                                --exit-code 0
+
+                            if [ ! -f "$REPORT_DIR/gitleaks-report.json" ]; then
+                                echo "Gitleaks report missing."
+                                exit 2
+                            fi
+
+                            echo "Gitleaks scan complete. Output saved to $REPORT_DIR/gitleaks-report.json"
+                        '''
+                    }
+                }
+
+                // 2. SEMGREP SAST
+                stage('Semgrep - SAST') {
+                    steps {
+                        sh '''
+                            set +e
+
+                            semgrep scan \\
+                                --config p/php \\
+                                --config p/phpcs-security-audit \\
+                                --config p/security-audit \\
+                                --config p/owasp-top-ten \\
+                                --config p/cwe-top-25 \\
+                                --config p/xss \\
+                                --config p/command-injection \\
+                                --config p/sql-injection \\
+                                --config p/secrets \\
+                                --config p/jwt \\
+                                --config p/insecure-transport \\
+                                --config p/javascript \\
+                                --exclude vendor \\
+                                --exclude node_modules \\
+                                --exclude tests \\
+                                --exclude assets \\
+                                --exclude system \\
+                                --exclude reports \\
+                                --exclude 'application/third_party' \\
+                                --exclude 'application/libraries/dompdf*' \\
+                                --exclude 'semgrep.*' \\
+                                --timeout 120 \\
+                                --timeout-threshold 0 \\
+                                --max-target-bytes 5000000 \\
+                                --json-output="$REPORT_DIR/semgrep.json" \\
+                                --text-output="$REPORT_DIR/semgrep.txt" \\
+                                . || true
+
+                            if [ ! -s "$REPORT_DIR/semgrep.json" ]; then
+                                echo '{"results":[],"errors":[{"message":"Semgrep did not produce a JSON report; inspect Jenkins console log."}]}' > "$REPORT_DIR/semgrep.json"
+                            fi
+                            if [ ! -f "$REPORT_DIR/semgrep.txt" ]; then
+                                echo "Semgrep text report was not generated." > "$REPORT_DIR/semgrep.txt"
+                            fi
+                            echo "Semgrep scan complete. Reports saved in $REPORT_DIR."
+                        '''
+                    }
+                }
+
+                // 3. SONARQUBE SAST
+                stage('SonarQube - SAST') {
+                    steps {
+                        withCredentials([
+                            string(
+                                credentialsId: 'sonar',
+                                variable: 'SONAR_TOKEN'
+                            )
+                        ]) {
+                            sh '''
+                                set +e
+
+                                "$SCANNER_HOME/bin/sonar-scanner" \
+                                    -Dsonar.projectKey=Dfos \
+                                    -Dsonar.projectName="DF-OS" \
+                                    -Dsonar.projectVersion=1.0 \
+                                    -Dsonar.sources=. \
+                                    -Dsonar.host.url=http://103.25.175.146 \
+                                    -Dsonar.token="$SONAR_TOKEN" \
+                                    -Dsonar.sourceEncoding=UTF-8 \
+                                    -Dsonar.php.file.suffixes=.php \
+                                    -Dsonar.qualitygate.wait=false \
+                                    -Dsonar.exclusions="**/composer-setup.php,**/vendor/**,**/system/**,**/application/third_party/**,**/application/libraries/**,**/build/**,**/*_backup_*.php,**/*_old.php,**/node_modules/**,**/.git/**,**/sample_csv/**,**/assets/**,**/devsecops-reports/**" \
+                                    > "$REPORT_DIR/sonarqube-report.txt" 2>&1
+
+                                cat "$REPORT_DIR/sonarqube-report.txt"
+                                echo "SonarQube analysis complete."
+                            '''
+                        }
+                    }
+                }
+
+                // 4. OWASP ZAP DAST (Pen Test with Headless Spider)
+                stage('OWASP ZAP - Web DAST') {
+                    steps {
+                        sh '''
+                            set +e
+
+                            "$ZAP_HOME/zap.sh" \
+                                -cmd \
+                                -port "$ZAP_PORT" \
+                                -autorun "$REPORT_DIR/zap-plan.yaml" \
+                                > "$REPORT_DIR/zap-console-report.txt" 2>&1
+
+                            cat "$REPORT_DIR/zap-console-report.txt"
+                            echo "OWASP ZAP scan complete."
+                        '''
+                    }
+                }
+
+                // 5. TRIVY FILESYSTEM SECURITY SCAN + TRIVY SBOM
+                stage('Trivy - Filesystem Security Scan') {
+                    steps {
+                        sh '''
+                            set +e
+
+                            "$TRIVY_BIN" fs \
+                                --scanners vuln,misconfig,secret \
+                                --severity HIGH,CRITICAL \
+                                --skip-dirs .git \
+                                --skip-dirs vendor \
+                                --skip-dirs node_modules \
+                                --skip-dirs devsecops-reports \
+                                --skip-dirs reports \
+                                --timeout 15m \
+                                --format json \
+                                --output "$REPORT_DIR/trivy-report.json" \
+                                .
+
+                            # Also generate HTML report natively from Trivy
+                            "$TRIVY_BIN" fs \
+                                --scanners vuln,misconfig,secret \
+                                --severity HIGH,CRITICAL \
+                                --skip-dirs .git \
+                                --skip-dirs vendor \
+                                --skip-dirs node_modules \
+                                --skip-dirs devsecops-reports \
+                                --skip-dirs reports \
+                                --timeout 15m \
+                                --format template \
+                                --template "@contrib/html.tpl" \
+                                --output "$REPORT_DIR/trivy-native.html" \
+                                . 2>/dev/null || true
+
+                            # CycloneDX SBOM generated by Trivy (used by the SBOM security gate)
+                            "$TRIVY_BIN" fs \
+                                --format cyclonedx \
+                                --skip-dirs .git \
+                                --skip-dirs vendor \
+                                --skip-dirs node_modules \
+                                --skip-dirs devsecops-reports \
+                                --skip-dirs reports \
+                                --timeout 15m \
+                                --output "$REPORT_DIR/trivy-sbom.cdx.json" \
+                                .
+
+                            echo "Trivy scan and Trivy SBOM complete."
+                        '''
+                    }
+                }
+
+                // 6. SYFT - SBOM GENERATION
+                stage('Syft - SBOM Generation') {
+                    steps {
+                        sh '''
+                            set +e
+
+                            "$SYFT_BIN" dir:. \
+                                --exclude ./.git \
+                                --exclude ./vendor \
+                                --exclude ./node_modules \
+                                --exclude ./devsecops-reports \
+                                --exclude ./reports \
+                                --source-name "$SBOM_NAME" \
+                                --source-version "$BUILD_NUMBER" \
+                                -o cyclonedx-json="$REPORT_DIR/syft-sbom.cdx.json" \
+                                -o table="$REPORT_DIR/syft-packages.txt"
+
+                            echo "Syft SBOM complete."
+                        '''
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------
+        // 4. TRIVY - VULNERABILITY SCAN AGAINST BOTH SBOMs
+        //    Runs after the parallel block so both SBOMs exist.
+        // --------------------------------------------------
+        stage('SBOM Vulnerability Scan') {
+            steps {
+                sh '''
+                    set +e
+
+                    for SRC in trivy syft; do
+                        SBOM_FILE="$REPORT_DIR/${SRC}-sbom.cdx.json"
+                        if [ ! -s "$SBOM_FILE" ]; then
+                            echo "$SBOM_FILE missing or empty; skipping."
+                            continue
+                        fi
+
+                        "$TRIVY_BIN" sbom \
+                            --scanners vuln \
+                            --format json \
+                            --output "$REPORT_DIR/${SRC}-sbom-vulnerabilities.json" \
+                            "$SBOM_FILE"
+                        echo "Trivy scan of ${SRC} SBOM exit code: $?"
+
+                        # Plain-text table from the same JSON (no second scan)
+                        "$TRIVY_BIN" convert \
+                            --format table \
+                            --output "$REPORT_DIR/${SRC}-sbom-vulnerabilities.txt" \
+                            "$REPORT_DIR/${SRC}-sbom-vulnerabilities.json"
+                    done
+
+                    # Findings are shown in the HTML reports; the gate stage decides pass/fail.
+                    exit 0
+                '''
+            }
+        }
+
+        // --------------------------------------------------
+        // 5. SBOM SECURITY GATE (Trivy SBOM)
+        //    warn  -> build UNSTABLE when findings exist
+        //    block -> build FAILURE when findings exist
+        // --------------------------------------------------
+        stage('SBOM Security Gate') {
+            steps {
+                script {
+                    def gateResult = (params.SBOM_GATE_MODE == 'block') ? 'FAILURE' : 'UNSTABLE'
+                    catchError(buildResult: gateResult, stageResult: gateResult) {
+                        sh '''
+                            set +e
+
+                            GATE_SEV="${SBOM_GATE_SEVERITY:-CRITICAL}"
+                            SBOM_FILE="$REPORT_DIR/trivy-sbom.cdx.json"
+                            STATUS_FILE="$REPORT_DIR/sbom-gate-status.txt"
+
+                            if [ ! -s "$SBOM_FILE" ]; then
+                                echo "SKIPPED - Trivy SBOM was not generated" > "$STATUS_FILE"
+                                echo "Gate skipped: $SBOM_FILE missing."
+                                exit 0
+                            fi
+
+                            # Accepted risks can be listed by CVE ID in .trivyignore at the repo root.
+                            "$TRIVY_BIN" sbom \
+                                --scanners vuln \
+                                --severity "$GATE_SEV" \
+                                --exit-code 3 \
+                                --format table \
+                                --output "$REPORT_DIR/sbom-gate.txt" \
+                                "$SBOM_FILE"
+                            RC=$?
+
+                            cat "$REPORT_DIR/sbom-gate.txt" 2>/dev/null
+
+                            case "$RC" in
+                                0) echo "PASSED - no $GATE_SEV vulnerabilities" > "$STATUS_FILE" ;;
+                                3) echo "FAILED - $GATE_SEV vulnerabilities found" > "$STATUS_FILE" ;;
+                                *) echo "ERROR - Trivy exited with code $RC" > "$STATUS_FILE" ;;
+                            esac
+
+                            cat "$STATUS_FILE"
+                            exit $RC
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------
+    // 6. HTML REPORT GENERATION & DASHBOARD CREATION
+    // ------------------------------------------------------
+    post {
+        always {
+            script {
+                sh '''
+                    set +e
+
+                    mkdir -p "$REPORT_DIR"
+
+                    python3 - <<'PY'
+import os
+import json
+import html
+from pathlib import Path
+from datetime import datetime, timezone
+
+report_dir = Path(os.environ["REPORT_DIR"])
+build_number = os.environ.get("BUILD_NUMBER", "N/A")
+
+def read_json(filename):
+    path = report_dir / filename
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(errors="replace"))
+    except Exception:
+        return None
+
+def read_text(filename):
+    path = report_dir / filename
+    if not path.exists():
+        return "Report not generated."
+    return path.read_text(errors="replace")
+
+def safe(value):
+    return html.escape(str(value if value is not None else ""))
+
+def write_html(filename, title, content):
+    document = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{safe(title)}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 30px; background: #f3f5f9; color: #202938; }}
+h1 {{ color: #172554; }}
+table {{ border-collapse: collapse; width: 100%; background: white; }}
+th, td {{ border: 1px solid #ddd; padding: 10px; text-align: left; }}
+th {{ background: #172554; color: white; }}
+pre {{ background: white; padding: 15px; overflow-x: auto; white-space: pre-wrap; }}
+a {{ color: #1d4ed8; text-decoration: none; font-weight: bold; }}
+.btn-back {{ display: inline-block; margin-bottom: 20px; padding: 8px 15px; background: #172554; color: white; border-radius: 5px; }}
+</style>
+</head>
+<body>
+<a href="index.html" class="btn-back">← Back to Security Dashboard</a>
+{content}
+</body>
+</html>"""
+    (report_dir / filename).write_text(document)
+
+# --------------------------------------------------
+# 1. SEMGREP HTML (interactive report)
+# --------------------------------------------------
+workspace = Path(os.environ.get("WORKSPACE", "."))
+semgrep_data = read_json("semgrep.json")
+if not isinstance(semgrep_data, dict):
+    semgrep_data = {"results": [], "errors": [{"type": "Report error", "message": "semgrep.json missing or invalid"}]}
+
+SG_SEV = {"ERROR": "high", "WARNING": "medium", "INFO": "low"}
+
+def sg_list(v):
+    return v if isinstance(v, list) else ([v] if v else [])
+
+def sg_code(path, start, end):
+    try:
+        lines = (workspace / path).read_text(errors="replace").splitlines()
+    except Exception:
+        return ""
+    end = min(end, start + 7)
+    return chr(10).join(l.rstrip() for l in lines[start - 1:end])[:3000]
+
+sg_rules, sg_findings, sg_errors = {}, [], []
+for x in semgrep_data.get("results", []) or []:
+    if not isinstance(x, dict):
+        continue
+    rid = x.get("check_id", "unknown")
+    ex = x.get("extra", {}) or {}
+    md = ex.get("metadata", {}) or {}
+    sg_rules.setdefault(rid, dict(
+        sev=SG_SEV.get(str(ex.get("severity", "")).upper(), "low"),
+        msg=ex.get("message", ""),
+        url=md.get("shortlink") or md.get("source", ""),
+        cwe=[str(c).split(":")[0] for c in sg_list(md.get("cwe"))][:2],
+        owasp=[str(o).split(" - ")[0] for o in sg_list(md.get("owasp")) if "2021" in str(o)][:1],
+        conf=md.get("confidence", "")))
+    p = x.get("path", "")
+    s_line = (x.get("start") or {}).get("line", 0)
+    e_line = (x.get("end") or {}).get("line", s_line)
+    code = ex.get("lines", "")
+    if not code or code == "requires login":
+        code = sg_code(p, s_line, e_line)
+    if "secrets" in rid or "private-key" in rid:
+        code = "[secret value redacted from report]"
+    sg_findings.append(dict(file=p, rule=rid, line=s_line, end=e_line, code=code,
+                            area="app" if p.startswith("application/") else "other"))
+
+for e in semgrep_data.get("errors", []) or []:
+    if not isinstance(e, dict):
+        continue
+    t = e.get("type")
+    t = t if isinstance(t, str) else (t[0] if t else "Error")
+    msg = str(e.get("message", "") or "")
+    path = e.get("path") or ""
+    if not path and e.get("spans"):
+        path = (e["spans"][0] or {}).get("file", "")
+    if not path and "line " in msg:
+        path = msg.split("line ", 1)[1].split(":", 1)[0].strip()
+    rule = e.get("rule_id") or ""
+    if not rule and "running " in msg:
+        rule = msg.split("running ", 1)[1].split(" on", 1)[0]
+    sg_errors.append(dict(type=t, path=path, rule=rule.split(".")[-1]))
+
+sg_payload = dict(rules=sg_rules, findings=sg_findings, errors=sg_errors,
+                  version=semgrep_data.get("version", ""),
+                  scanned=len((semgrep_data.get("paths") or {}).get("scanned", [])))
+
+SG_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+:root{color-scheme:light;
+ --bg:#F5F7FA;--panel:#FFFFFF;--ink:#16233A;--muted:#5A6779;--line:#DCE2EA;--code:#F0F3F7;
+ --high:#C0392B;--high-bg:#FBECEA;--med:#B86E00;--med-bg:#FFF3E0;--low:#5A6779;--low-bg:#EEF1F5;
+ --accent:#1F5FBF;--focus:#1F5FBF}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;
+ --bg:#0F1722;--panel:#172131;--ink:#E4EAF2;--muted:#9AA8BA;--line:#2A3749;--code:#111A27;
+ --high:#FF7A6B;--high-bg:#3A1E1E;--med:#FFB547;--med-bg:#36290F;--low:#A9B5C6;--low-bg:#222D3D;
+ --accent:#7FB0FF;--focus:#7FB0FF}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 "IBM Plex Sans",-apple-system,"Segoe UI",Roboto,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:32px 20px 64px}
+header h1{font-size:28px;line-height:1.2;margin:0 0 6px;font-weight:700;letter-spacing:-.01em}
+header p{margin:0;color:var(--muted)}
+.totals{display:flex;flex-wrap:wrap;gap:28px;margin:24px 0 8px;padding:18px 22px;background:var(--panel);border:1px solid var(--line);border-radius:10px}
+.totals div{min-width:120px}.totals b{display:block;font-size:26px;line-height:1.1}
+.totals span{color:var(--muted);font-size:13px}
+h2{font-size:19px;margin:34px 0 12px}
+.prio{display:grid;gap:10px}
+.prio button{all:unset;cursor:pointer;display:grid;grid-template-columns:110px 1fr auto;gap:16px;align-items:center;
+ padding:14px 18px;background:var(--panel);border:1px solid var(--line);border-left:5px solid var(--c);border-radius:8px}
+.prio button:hover{border-color:var(--c)}
+.prio button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.prio .lvl{font-weight:600;color:var(--c);font-size:13px}
+.prio h3{margin:0;font-size:15px}.prio p{margin:2px 0 0;color:var(--muted);font-size:13.5px}
+.prio .n{font-size:22px;font-weight:700;text-align:right}.prio .n small{display:block;font-size:12px;font-weight:400;color:var(--muted)}
+.bar{position:sticky;top:0;z-index:5;background:var(--bg);padding:12px 0;display:flex;flex-wrap:wrap;gap:10px;align-items:center;border-bottom:1px solid var(--line)}
+.bar input,.bar select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+.bar input{flex:1;min-width:200px}
+.bar input:focus-visible,.bar select:focus-visible,.seg button:focus-visible,summary:focus-visible{outline:2px solid var(--focus);outline-offset:1px}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:6px;overflow:hidden}
+.seg button{font:inherit;font-size:13.5px;border:0;background:var(--panel);color:var(--ink);padding:7px 12px;cursor:pointer}
+.seg button[aria-pressed=true]{background:var(--ink);color:var(--panel)}
+#count{color:var(--muted);font-size:13.5px;margin-left:auto}
+details.file{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:10px 0}
+details.file>summary{cursor:pointer;padding:11px 16px;display:flex;gap:10px;align-items:center;list-style:none}
+details.file>summary::-webkit-details-marker{display:none}
+details.file>summary::before{content:"▸";color:var(--muted);transition:transform .15s}
+details.file[open]>summary::before{transform:rotate(90deg)}
+.path{font-family:"IBM Plex Mono",Consolas,monospace;font-size:13.5px;word-break:break-all;flex:1}
+.pill{font-size:12px;font-weight:600;padding:2px 8px;border-radius:20px;white-space:nowrap}
+.p-high{color:var(--high);background:var(--high-bg)}.p-medium{color:var(--med);background:var(--med-bg)}.p-low{color:var(--low);background:var(--low-bg)}
+.tp{font-size:12px;color:var(--muted);border:1px solid var(--line);padding:1px 7px;border-radius:20px}
+.rule{border-top:1px solid var(--line);padding:12px 16px}
+.rule h4{margin:0 0 4px;font-size:14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.rule h4 code{font-family:"IBM Plex Mono",Consolas,monospace;font-weight:500;font-size:13px}
+.rule .msg{margin:0 0 8px;color:var(--muted);font-size:13.5px;max-width:80ch}
+.rule a{color:var(--accent)}
+.hit{display:grid;grid-template-columns:64px 1fr;margin:6px 0;border-radius:6px;overflow:hidden;background:var(--code)}
+.hit .ln{font:12.5px "IBM Plex Mono",Consolas,monospace;color:var(--muted);padding:8px 10px;text-align:right;border-right:1px solid var(--line)}
+.hit pre{margin:0;padding:8px 12px;font:12.5px/1.5 "IBM Plex Mono",Consolas,monospace;white-space:pre-wrap;word-break:break-word;overflow-x:auto}
+.empty{padding:40px;text-align:center;color:var(--muted)}
+.note{color:var(--muted);font-size:13.5px;margin:-4px 0 10px;max-width:80ch}
+.note code,.gaps code{font-family:"IBM Plex Mono",Consolas,monospace;font-size:12.5px}
+.gaps{background:var(--panel);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.gaps div{display:grid;grid-template-columns:120px 1fr auto;gap:12px;padding:8px 16px;border-top:1px solid var(--line);font-size:13.5px;align-items:center}
+.gaps div:first-child{border-top:0}
+.gaps .t{font-weight:600;color:var(--med)}.gaps .r{color:var(--muted);font-size:12.5px}
+.meta{display:flex;flex-wrap:wrap;gap:6px;margin:0 0 8px}
+.meta span{font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:4px;padding:1px 6px}
+.lines{display:inline-flex;margin:0 6px 6px 0}
+.lines span{font:12.5px "IBM Plex Mono",Consolas,monospace;background:var(--code);border-radius:4px;padding:3px 8px}
+.bk{font-size:12px;color:var(--high);border:1px solid var(--high);padding:0 7px;border-radius:20px;white-space:nowrap}
+@media (max-width:640px){.gaps div{grid-template-columns:1fr}}
+.back{display:inline-block;margin:0 0 18px;padding:7px 14px;border-radius:6px;background:var(--ink);color:var(--panel);text-decoration:none;font-weight:600;font-size:14px}
+.back:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+footer{margin-top:40px;color:var(--muted);font-size:13px}
+@media (max-width:640px){.prio button{grid-template-columns:1fr auto}.prio .lvl{grid-column:1/-1}.hit{grid-template-columns:48px 1fr}}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+__BACK__<header>
+<h1>__TITLE__</h1>
+<p id="sub"></p>
+
+</header>
+<div class="totals" id="totals"></div>
+
+<h2>Fix in this order</h2>
+<div class="prio" id="prio"></div>
+
+<h2>Files not fully scanned</h2>
+<p class="note">Semgrep hit a timeout or could not fully parse these files, so they may contain issues that are not listed here. Timeouts: rescan with <code>--timeout 120 --timeout-threshold 0</code>. Syntax errors: usually a broken or unused file; fix or delete it.</p>
+<div class="gaps" id="gaps"></div>
+<h2>All findings</h2>
+<div class="bar">
+ <input id="q" type="search" placeholder="Search file, rule or code…" aria-label="Search findings">
+ <div class="seg" role="group" aria-label="Code area">
+  <button data-area="app" aria-pressed="true">Application code</button>
+  <button data-area="third" aria-pressed="false">Other files</button>
+  <button data-area="all" aria-pressed="false">All</button>
+ </div>
+ <select id="sev" aria-label="Severity"><option value="">All severities</option><option value="high">High</option><option value="medium">Medium</option><option value="low">Low</option></select>
+ <select id="rule" aria-label="Rule"><option value="">All rules</option></select>
+ <span id="count"></span>
+</div>
+<div id="list"></div>
+<footer>Generated by semgrep2html.py from Semgrep JSON output. Code shown is read from the source files at scan location; secret values are redacted. Files tagged “backup copy” look like old or dated duplicates and can usually be deleted.</footer>
+</div>
+<script>
+const DATA = __DATA__;
+const R = DATA.rules, F = DATA.findings;
+const short = id => id.split('.').pop();
+const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const sevLabel = {high:'High',medium:'Medium',low:'Low'};
+const app = F.filter(f => f.area==='app');
+const cnt = (arr, fn) => arr.filter(fn).length;
+const files = new Set(app.map(f=>f.file)).size;
+const BK=/(_old(_ui)?|_backup_[0-9]+|_[0-9]{1,2}|_[0-9]{2}_[0-9]{2}_[0-9]{4}|_[0-9]{8}|Bk)[.]php$/;
+document.getElementById('sub').textContent=`Semgrep ${DATA.version}. ${DATA.scanned.toLocaleString()} files scanned.`;
+document.getElementById('gaps').innerHTML=DATA.errors.map(e=>`<div><span class="t">${esc(e.type)}</span><code>${esc(e.path)}</code><span class="r">${esc(e.rule)}</span></div>`).join('');
+document.getElementById('totals').innerHTML = [
+ [F.length.toLocaleString(), 'total findings'],
+ [app.length, 'in your own code'],
+ [files, 'of your files affected'],
+ [cnt(app,f=>R[f.rule].sev==='high'), 'high severity in your code'],
+ [cnt(F,f=>BK.test(f.file)), 'in backup or old copies']
+].map(([n,l])=>`<div><b>${n}</b><span>${l}</span></div>`).join('');
+
+const PRIO = [
+ {k:'remove', f:f=>f.area==='other', lvl:'Critical', c:'var(--high)', t:'Files that should not be in the project',
+  d:'Findings outside application/, such as installer scripts, old reports or helper packages. Remove what is not needed in the repo.'},
+ {k:'secrets', f:f=>f.area==='app'&&f.rule.includes('secrets.'), lvl:'Critical', c:'var(--high)', t:'Secrets committed to the repo',
+  d:'Firebase admin service account and a private key. Rotate them, then move them out of the web root.'},
+ {k:'sql', f:f=>f.area==='app'&&f.rule.endsWith('tainted-sql-string'), lvl:'High', c:'var(--high)', t:'SQL injection',
+  d:'Request values concatenated into SQL. Use CodeIgniter query bindings (? placeholders).'},
+ {k:'exec', f:f=>/(exec-use|backticks-use|eval-detected)$/.test(f.rule)&&f.area==='app', lvl:'High', c:'var(--high)', t:'Shell command execution',
+  d:'exec() calls and PHP backticks, which run text as a shell command. Check that no request input reaches them.'},
+ {k:'xss', f:f=>f.area==='app'&&f.rule.endsWith('echoed-request'), lvl:'High', c:'var(--med)', t:'Cross-site scripting (XSS)',
+  d:'Request input echoed into HTML. Wrap output with html_escape().'},
+ {k:'path', f:f=>f.area==='app'&&f.rule.endsWith('tainted-filename'), lvl:'Medium', c:'var(--med)', t:'Path traversal',
+  d:'Request input used in file paths. Apply basename() and an allow-list.'},
+ {k:'crypto', f:f=>f.rule.endsWith('weak-crypto'), lvl:'Review', c:'var(--low)', t:'Weak hashing (md5 / sha1)',
+  d:'Mostly cache keys and file names, which is fine. Replace only where used for passwords, tokens or signatures.'},
+];
+document.getElementById('prio').innerHTML = PRIO.map(p=>{
+ const hits = F.filter(p.f); const nf = new Set(hits.map(f=>f.file)).size;
+ return `<button data-p="${p.k}" style="--c:${p.c}"><span class="lvl">${p.lvl}</span>
+ <span><h3>${p.t}</h3><p>${p.d}</p></span><span class="n">${hits.length}<small>${nf} file${nf===1?'':'s'}</small></span></button>`;
+}).join('');
+
+const ruleSel = document.getElementById('rule');
+Object.keys(R).sort().forEach(r=>{const o=document.createElement('option');o.value=r;o.textContent=short(r);ruleSel.appendChild(o)});
+
+let state = {area:'app', q:'', sev:'', rule:'', p:''};
+function render(){
+ const q = state.q.toLowerCase(); const pt = PRIO.find(p=>p.k===state.p);
+ const list = F.filter(f => (state.area==='all'||f.area===state.area)
+   && (!state.sev || R[f.rule].sev===state.sev)
+   && (!state.rule || f.rule===state.rule)
+   && (!pt || pt.f(f))
+   && (!q || (f.file+' '+f.rule+' '+(f.code||'')).toLowerCase().includes(q)));
+ const byFile = new Map();
+ list.forEach(f=>{ if(!byFile.has(f.file)) byFile.set(f.file,[]); byFile.get(f.file).push(f); });
+ const order={high:0,medium:1,low:2};
+ const groups=[...byFile.entries()].sort((a,b)=>{
+  const sa=Math.min(...a[1].map(f=>order[R[f.rule].sev])), sb=Math.min(...b[1].map(f=>order[R[f.rule].sev]));
+  return sa-sb || b[1].length-a[1].length;});
+ document.getElementById('count').textContent = `${list.length.toLocaleString()} findings in ${groups.length} files`;
+ const open = groups.length <= 8;
+ document.getElementById('list').innerHTML = groups.length ? groups.map(([file,fs])=>{
+  const byRule = new Map(); fs.forEach(f=>{ if(!byRule.has(f.rule)) byRule.set(f.rule,[]); byRule.get(f.rule).push(f); });
+  const top = fs.map(f=>R[f.rule].sev).sort((a,b)=>order[a]-order[b])[0];
+  return `<details class="file"${open?' open':''}><summary><span class="path">${esc(file)}</span>
+   ${BK.test(file)?'<span class="bk">backup copy</span>':''}
+   <span class="pill p-${top}">${fs.length} · ${sevLabel[top]}</span></summary>
+   ${[...byRule.entries()].map(([rid,hs])=>{const r=R[rid];return `<div class="rule">
+    <h4><span class="pill p-${r.sev}">${sevLabel[r.sev]}</span><code>${esc(short(rid))}</code></h4>
+    <p class="msg">${esc(r.msg)} ${r.url?`<a href="${esc(r.url)}" target="_blank" rel="noopener">Rule details</a>`:''}</p>
+    <div class="meta">${[...r.cwe,...r.owasp,r.conf?('Confidence: '+r.conf.toLowerCase()):''].filter(Boolean).map(x=>`<span>${esc(x)}</span>`).join('')}</div>
+    ${hs.sort((a,b)=>a.line-b.line).map(h=>h.code?`<div class="hit"><span class="ln">${h.line}</span><pre>${esc(h.code)}</pre></div>`:`<div class="lines"><span>${h.end>h.line?'Lines '+h.line+'–'+h.end:'Line '+h.line}</span></div>`).join('')}
+   </div>`}).join('')}</details>`;
+ }).join('') : '<div class="empty">No findings match these filters. Clear the search or switch the area to All.</div>';
+}
+document.getElementById('q').addEventListener('input',e=>{state.q=e.target.value;render()});
+document.getElementById('sev').addEventListener('change',e=>{state.sev=e.target.value;render()});
+ruleSel.addEventListener('change',e=>{state.rule=e.target.value;state.p='';render()});
+document.querySelectorAll('.seg button').forEach(b=>b.addEventListener('click',()=>{
+ state.area=b.dataset.area; document.querySelectorAll('.seg button').forEach(x=>x.setAttribute('aria-pressed',x===b)); render();}));
+document.querySelectorAll('.prio button').forEach(b=>b.addEventListener('click',()=>{
+ state.p = state.p===b.dataset.p ? '' : b.dataset.p; state.rule=''; ruleSel.value='';
+ state.area='all'; document.querySelectorAll('.seg button').forEach(x=>x.setAttribute('aria-pressed',x.dataset.area==='all'));
+ render(); document.querySelector('.bar').scrollIntoView({behavior:'smooth'});}));
+render();
+</script>
+</body>
+</html>
+"""
+
+sg_back = '<a class="back" href="index.html">&larr; Back to Security Dashboard</a>'
+sg_page = (SG_TEMPLATE
+           .replace("__TITLE__", safe("Semgrep SAST Report - Build #" + str(build_number)))
+           .replace("__BACK__", sg_back)
+           .replace("__DATA__", json.dumps(sg_payload).replace("</", "<" + chr(92) + "/")))
+(report_dir / "semgrep-report.html").write_text(sg_page)
+
+# --------------------------------------------------
+# 2. GITLEAKS HTML
+# --------------------------------------------------
+gitleaks = read_json("gitleaks-report.json")
+gitleaks_findings = gitleaks if isinstance(gitleaks, list) else []
+
+gitleaks_rows = ""
+for item in gitleaks_findings:
+    if not isinstance(item, dict):
+        continue
+    gitleaks_rows += (
+        "<tr>"
+        f"<td>{safe(item.get('RuleID'))}</td>"
+        f"<td>{safe(item.get('File'))}</td>"
+        f"<td>{safe(item.get('StartLine'))}</td>"
+        f"<td>{safe(item.get('Description'))}</td>"
+        "</tr>"
+    )
+
+if not gitleaks_rows:
+    gitleaks_rows = '<tr><td colspan="4">No secrets detected or report unavailable.</td></tr>'
+
+gitleaks_content = f"""
+<h1>Gitleaks - Secret Scanning Report</h1>
+<p>Total findings: <strong>{len(gitleaks_findings)}</strong></p>
+<table>
+<tr><th>Rule</th><th>File</th><th>Line</th><th>Description</th></tr>
+{gitleaks_rows}
+</table>
+<p>Note: Hardcoded secrets are redacted for security.</p>
+"""
+write_html("gitleaks-report.html", "Gitleaks Secret Report", gitleaks_content)
+
+# --------------------------------------------------
+# 3. TRIVY HTML
+# --------------------------------------------------
+trivy = read_json("trivy-report.json")
+trivy_rows = ""
+trivy_counts = {"Vulnerabilities": 0, "Misconfigurations": 0, "Secrets": 0}
+
+if isinstance(trivy, dict):
+    for result in trivy.get("Results", []) or []:
+        target = result.get("Target", "Unknown")
+        for key, finding_type in [
+            ("Vulnerabilities", "Vulnerability"),
+            ("Misconfigurations", "Misconfiguration"),
+            ("Secrets", "Secret")
+        ]:
+            findings = result.get(key, []) or []
+            trivy_counts[key] += len(findings)
+
+            for item in findings:
+                severity = item.get("Severity", "N/A")
+                if key == "Vulnerabilities":
+                    details = f"{item.get('VulnerabilityID', '')} - {item.get('PkgName', '')} {item.get('InstalledVersion', '')} (Fixed in: {item.get('FixedVersion') or 'No fix'})"
+                elif key == "Secrets":
+                    details = f"{item.get('RuleID', '')} at line {item.get('StartLine', '?')}"
+                else:
+                    details = item.get("Title") or item.get("ID") or finding_type
+
+                trivy_rows += (
+                    "<tr>"
+                    f"<td>{safe(finding_type)}</td>"
+                    f"<td>{safe(severity)}</td>"
+                    f"<td>{safe(target)}</td>"
+                    f"<td>{safe(details)}</td>"
+                    "</tr>"
+                )
+
+if not trivy_rows:
+    trivy_rows = '<tr><td colspan="4">No HIGH or CRITICAL issues found.</td></tr>'
+
+trivy_content = f"""
+<h1>Trivy - Security Scan Report</h1>
+<p>Total Findings: <strong>{sum(trivy_counts.values())}</strong></p>
+<ul>
+<li>Vulnerabilities: {trivy_counts["Vulnerabilities"]}</li>
+<li>Misconfigurations: {trivy_counts["Misconfigurations"]}</li>
+<li>Secrets: {trivy_counts["Secrets"]}</li>
+</ul>
+<table>
+<tr><th>Type</th><th>Severity</th><th>Target</th><th>Details</th></tr>
+{trivy_rows}
+</table>
+"""
+write_html("trivy-report.html", "Trivy Security Report", trivy_content)
+
+# --------------------------------------------------
+# 4. SBOM REPORTS: SYFT PACKAGES + SBOM VULNERABILITIES
+# --------------------------------------------------
+SEV_ORDER = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
+
+def vparts(value):
+    text = str(value or "").strip().lstrip("vV")
+    parts = []
+    for piece in text.split("."):
+        digits = ""
+        for ch in piece:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        parts.append(int(digits) if digits else 0)
+    while len(parts) < 3:
+        parts.append(0)
+    return tuple(parts)
+
+def pick_fix(installed, fixed):
+    # Lowest fixed version newer than installed, preferring the same major version
+    current = vparts(installed)
+    options = [f.strip() for f in str(fixed or "").split(",") if f.strip()]
+    newer = [f for f in options if vparts(f) > current]
+    if not newer:
+        return ""
+    same_major = [f for f in newer if vparts(f)[0] == current[0]]
+    return min(same_major or newer, key=vparts)
+
+def load_trivy_scan(filename, source):
+    data = read_json(filename)
+    if not isinstance(data, dict):
+        return None
+    rows = []
+    for result in data.get("Results", []) or []:
+        for v in result.get("Vulnerabilities", []) or []:
+            sev = str(v.get("Severity", "UNKNOWN")).upper()
+            if sev not in SEV_ORDER:
+                sev = "UNKNOWN"
+            rows.append(dict(
+                id=v.get("VulnerabilityID", ""),
+                pkg=v.get("PkgName", ""),
+                ver=v.get("InstalledVersion", ""),
+                fix=v.get("FixedVersion") or "",
+                sev=sev,
+                title=v.get("Title") or str(v.get("Description") or "")[:160],
+                url=v.get("PrimaryURL", ""),
+                purl=(v.get("PkgIdentifier") or {}).get("PURL", ""),
+                src=source))
+    return rows
+
+def embed(payload):
+    return json.dumps(payload).replace("</", "<" + chr(92) + "/")
+
+trivy_scan = load_trivy_scan("trivy-sbom-vulnerabilities.json", "trivy")
+syft_scan = load_trivy_scan("syft-sbom-vulnerabilities.json", "syft")
+
+merged = {}
+for scan in (trivy_scan or [], syft_scan or []):
+    for r in scan:
+        key = (r["id"], r["pkg"], r["ver"])
+        if key not in merged:
+            merged[key] = dict(r, src=[])
+        if r["src"] not in merged[key]["src"]:
+            merged[key]["src"].append(r["src"])
+all_vulns = sorted(merged.values(), key=lambda r: (SEV_ORDER.index(r["sev"]), r["pkg"], r["id"]))
+
+if trivy_scan is not None:
+    primary_src = "trivy"
+elif syft_scan is not None:
+    primary_src = "syft"
+else:
+    primary_src = ""
+primary_vulns = [r for r in all_vulns if primary_src in r["src"]]
+sev_counts = {s: sum(1 for r in primary_vulns if r["sev"] == s) for s in SEV_ORDER}
+
+plan_map = {}
+for r in primary_vulns:
+    item = plan_map.setdefault((r["pkg"], r["ver"]), dict(
+        pkg=r["pkg"], ver=r["ver"], target="", nofix=0, counts={s: 0 for s in SEV_ORDER}))
+    item["counts"][r["sev"]] += 1
+    fix = pick_fix(r["ver"], r["fix"])
+    if not fix:
+        item["nofix"] += 1
+    elif not item["target"] or vparts(fix) > vparts(item["target"]):
+        item["target"] = fix
+for item in plan_map.values():
+    item["major"] = bool(item["target"]) and vparts(item["target"])[0] != vparts(item["ver"])[0]
+upgrade_plan = sorted(plan_map.values(),
+                      key=lambda p: tuple(-p["counts"][s] for s in SEV_ORDER) + (p["pkg"],))
+
+compare = dict(
+    both=sum(1 for r in all_vulns if len(r["src"]) == 2),
+    trivy=sum(1 for r in all_vulns if r["src"] == ["trivy"]),
+    syft=sum(1 for r in all_vulns if r["src"] == ["syft"]))
+
+gate_file = report_dir / "sbom-gate-status.txt"
+gate_status = gate_file.read_text(errors="replace").strip() if gate_file.exists() else "NOT RUN - gate stage did not complete"
+
+sbom_downloads = [f for f in [
+    "trivy-sbom.cdx.json", "syft-sbom.cdx.json",
+    "trivy-sbom-vulnerabilities.json", "trivy-sbom-vulnerabilities.txt",
+    "syft-sbom-vulnerabilities.json", "syft-sbom-vulnerabilities.txt",
+    "sbom-gate.txt"] if (report_dir / f).is_file()]
+
+REPORT_CSS = """
+:root{color-scheme:light;--bg:#F5F7FA;--panel:#FFFFFF;--ink:#16233A;--muted:#5A6779;--line:#DCE2EA;--code:#F0F3F7;
+ --crit:#8E1B10;--crit-bg:#F9DEDA;--high:#C0392B;--high-bg:#FBECEA;--med:#B86E00;--med-bg:#FFF3E0;
+ --low:#3F6E9A;--low-bg:#E8F0F8;--unk:#5A6779;--unk-bg:#EEF1F5;--ok:#1E7B45;--accent:#1F5FBF}
+@media (prefers-color-scheme:dark){:root{color-scheme:dark;--bg:#0F1722;--panel:#172131;--ink:#E4EAF2;--muted:#9AA8BA;--line:#2A3749;--code:#111A27;
+ --crit:#FF8A80;--crit-bg:#4A1A17;--high:#FF7A6B;--high-bg:#3A1E1E;--med:#FFB547;--med-bg:#36290F;
+ --low:#8DB8E8;--low-bg:#1C2A3D;--unk:#A9B5C6;--unk-bg:#222D3D;--ok:#6FD39A;--accent:#7FB0FF}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,"Segoe UI",Roboto,Arial,sans-serif}
+.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 60px}
+h1{font-size:26px;line-height:1.2;margin:0 0 4px}
+h2{font-size:18px;margin:32px 0 10px}
+.sub,.note{color:var(--muted);font-size:14px;margin:0 0 10px;max-width:90ch}
+a{color:var(--accent)}
+.back{display:inline-block;margin:0 0 18px;padding:7px 14px;border-radius:6px;background:var(--ink);color:var(--panel);text-decoration:none;font-weight:600;font-size:14px}
+.gate{margin:16px 0;padding:12px 16px;border-radius:8px;border:1px solid var(--line);border-left-width:5px;background:var(--panel)}
+.gate.ok{border-left-color:var(--ok)}.gate.bad{border-left-color:var(--high)}.gate.warn{border-left-color:var(--med)}
+.cards{display:flex;flex-wrap:wrap;gap:12px;margin:16px 0}
+.card{flex:1;min-width:120px;background:var(--panel);border:1px solid var(--line);border-top:4px solid var(--c,var(--line));border-radius:8px;padding:12px 16px}
+.card b{display:block;font-size:26px;line-height:1.1}.card span{color:var(--muted);font-size:13px}
+.tbl{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{padding:8px 12px;border-top:1px solid var(--line);text-align:left;vertical-align:top}
+th{border-top:0;background:var(--code);font-size:12px;text-transform:uppercase;letter-spacing:.03em;color:var(--muted);white-space:nowrap}
+td.num{text-align:center;font-variant-numeric:tabular-nums}
+td.zero{color:var(--muted)}
+code{font-family:Consolas,"SFMono-Regular",Menlo,monospace;font-size:13px;word-break:break-all}
+.purl{font-family:Consolas,"SFMono-Regular",Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+.pill{display:inline-block;font-size:12px;font-weight:600;padding:1px 8px;border-radius:20px;white-space:nowrap;margin:0 4px 2px 0}
+.s-critical{color:var(--crit);background:var(--crit-bg)}.s-high{color:var(--high);background:var(--high-bg)}
+.s-medium{color:var(--med);background:var(--med-bg)}.s-low{color:var(--low);background:var(--low-bg)}.s-unknown{color:var(--unk);background:var(--unk-bg)}
+.tag{display:inline-block;font-size:12px;color:var(--muted);border:1px solid var(--line);border-radius:20px;padding:0 7px;white-space:nowrap;margin:0 4px 2px 0}
+.tag.warn{color:var(--med);border-color:var(--med)}
+.muted{color:var(--muted)}
+.bar{display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin:0 0 10px}
+.bar input[type=search],.bar select{font:inherit;color:var(--ink);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:7px 10px}
+.bar input[type=search]{flex:1;min-width:200px}
+.bar label{font-size:14px;display:flex;gap:6px;align-items:center}
+.count{color:var(--muted);font-size:13.5px;margin-left:auto}
+.dl{display:inline-block;margin:4px 14px 0 0;font-size:14px}
+"""
+
+SBOM_VULN_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>__CSS__</style>
+</head>
+<body>
+<div class="wrap">
+<a class="back" href="index.html">&larr; Back to Security Dashboard</a>
+<h1>__TITLE__</h1>
+<p class="sub" id="sub"></p>
+<div class="gate" id="gate"></div>
+<div class="cards" id="cards"></div>
+
+<h2>Upgrade plan</h2>
+<p class="note">One row per vulnerable package. Upgrade to is the lowest version that fixes every CVE listed for that package, staying on the same major version where a fix exists there.</p>
+<div class="tbl"><table id="plan"></table></div>
+
+<h2>Scanner comparison</h2>
+<p class="note" id="cmp"></p>
+
+<h2>All vulnerabilities</h2>
+<div class="bar">
+ <input id="q" type="search" placeholder="Search CVE, package or title" aria-label="Search vulnerabilities">
+ <select id="sev" aria-label="Severity"><option value="">All severities</option><option value="CRITICAL">Critical</option><option value="HIGH">High</option><option value="MEDIUM">Medium</option><option value="LOW">Low</option><option value="UNKNOWN">Unknown</option></select>
+ <select id="src" aria-label="Found in"><option value="">Found in any SBOM</option><option value="both">Found in both</option><option value="trivy">Only Trivy SBOM</option><option value="syft">Only Syft SBOM</option></select>
+ <span class="count" id="count"></span>
+</div>
+<div class="tbl"><table id="list"></table></div>
+
+<h2>Raw files</h2>
+<div id="dl"></div>
+</div>
+<script>
+const D = __DATA__;
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const SEV = ['CRITICAL','HIGH','MEDIUM','LOW','UNKNOWN'];
+const COL = {CRITICAL:'var(--crit)',HIGH:'var(--high)',MEDIUM:'var(--med)',LOW:'var(--low)',UNKNOWN:'var(--unk)'};
+const SRC = {trivy:'Trivy SBOM', syft:'Syft SBOM'};
+const cap = s => s.charAt(0) + s.slice(1).toLowerCase();
+const pill = s => `<span class="pill s-${s.toLowerCase()}">${cap(s)}</span>`;
+
+$('sub').textContent = D.primary
+  ? `Counts and the upgrade plan come from the ${SRC[D.primary]} scan. The list at the bottom merges both SBOM scans.`
+  : 'No SBOM vulnerability scan output was found for this build.';
+
+const g = D.gate;
+$('gate').className = 'gate ' + (g.indexOf('PASSED') === 0 ? 'ok' : (g.indexOf('FAILED') === 0 || g.indexOf('ERROR') === 0 ? 'bad' : 'warn'));
+$('gate').innerHTML = `<b>Security gate:</b> ${esc(g)}`;
+
+$('cards').innerHTML = SEV.map(s => `<div class="card" style="--c:${COL[s]}"><b>${D.counts[s]}</b><span>${cap(s)}</span></div>`).join('')
+  + `<div class="card"><b>${D.plan.length}</b><span>packages to upgrade</span></div>`;
+
+const head = '<tr><th>Package</th><th>Installed</th><th>Upgrade to</th>' + SEV.slice(0, 4).map(s => `<th>${cap(s)}</th>`).join('') + '<th>Note</th></tr>';
+$('plan').innerHTML = head + (D.plan.length ? D.plan.map(p => `<tr>
+  <td><code>${esc(p.pkg)}</code></td><td><code>${esc(p.ver)}</code></td><td><code>${esc(p.target || '-')}</code></td>
+  ${SEV.slice(0, 4).map(s => `<td class="num${p.counts[s] ? '' : ' zero'}">${p.counts[s]}</td>`).join('')}
+  <td>${p.major ? '<span class="tag warn">Major version change, test before release</span>' : ''}${p.nofix ? `<span class="tag">${p.nofix} without a fix yet</span>` : ''}</td>
+</tr>`).join('') : '<tr><td colspan="8">No vulnerable packages found.</td></tr>');
+
+$('cmp').textContent = (D.sources.trivy && D.sources.syft)
+  ? `${D.cmp.both} found in both SBOMs, ${D.cmp.trivy} only in the Trivy SBOM, ${D.cmp.syft} only in the Syft SBOM. Trivy warns that scanning a third-party (Syft) SBOM can be less accurate, so the security gate uses the Trivy SBOM.`
+  : 'Only one SBOM scan is available for this build, so there is nothing to compare.';
+
+function render() {
+  const q = $('q').value.toLowerCase(), sv = $('sev').value, sr = $('src').value;
+  const rows = D.vulns.filter(v => (!sv || v.sev === sv)
+    && (!sr || (sr === 'both' ? v.src.length === 2 : (v.src.length === 1 && v.src[0] === sr)))
+    && (!q || (v.id + ' ' + v.pkg + ' ' + v.title).toLowerCase().includes(q)));
+  $('count').textContent = `${rows.length} of ${D.vulns.length} shown`;
+  $('list').innerHTML = '<tr><th>Severity</th><th>CVE</th><th>Package</th><th>Installed</th><th>Fixed in</th><th>Title</th><th>Found in</th></tr>'
+    + (rows.length ? rows.map(v => `<tr>
+      <td>${pill(v.sev)}</td>
+      <td>${v.url ? `<a href="${esc(v.url)}" target="_blank" rel="noopener">${esc(v.id)}</a>` : esc(v.id)}</td>
+      <td><code>${esc(v.pkg)}</code></td><td><code>${esc(v.ver)}</code></td>
+      <td><code>${esc(v.fix || 'No fix yet')}</code></td><td>${esc(v.title)}</td>
+      <td>${v.src.map(x => `<span class="tag">${SRC[x]}</span>`).join('')}</td></tr>`).join('')
+      : '<tr><td colspan="7">No vulnerabilities match these filters.</td></tr>');
+}
+['q', 'sev', 'src'].forEach(id => $(id).addEventListener(id === 'q' ? 'input' : 'change', render));
+render();
+
+$('dl').innerHTML = D.downloads.length
+  ? D.downloads.map(f => `<a class="dl" href="${esc(f)}" download>${esc(f)}</a>`).join('')
+  : '<span class="muted">No raw files were generated.</span>';
+</script>
+</body>
+</html>
+"""
+
+sbom_vuln_payload = dict(
+    vulns=all_vulns, plan=upgrade_plan, counts=sev_counts, primary=primary_src,
+    gate=gate_status, cmp=compare, downloads=sbom_downloads,
+    sources=dict(trivy=trivy_scan is not None, syft=syft_scan is not None))
+(report_dir / "sbom-vuln-report.html").write_text(
+    SBOM_VULN_TEMPLATE
+    .replace("__CSS__", REPORT_CSS)
+    .replace("__TITLE__", safe("SBOM Vulnerability Report - Build #" + str(build_number)))
+    .replace("__DATA__", embed(sbom_vuln_payload)))
+
+# ---- Syft packages ----
+syft_sbom = read_json("syft-sbom.cdx.json")
+syft_sbom = syft_sbom if isinstance(syft_sbom, dict) else {}
+syft_root = (syft_sbom.get("metadata") or {}).get("component") or {}
+
+vuln_by_purl, vuln_by_nv = {}, {}
+for r in (syft_scan or []):
+    if r["purl"]:
+        bucket = vuln_by_purl.setdefault(r["purl"], {s: 0 for s in SEV_ORDER})
+        bucket[r["sev"]] += 1
+    bucket = vuln_by_nv.setdefault((r["pkg"], r["ver"]), {s: 0 for s in SEV_ORDER})
+    bucket[r["sev"]] += 1
+
+def license_names(comp):
+    names = []
+    for entry in comp.get("licenses", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("expression"):
+            names.append(entry["expression"])
+            continue
+        lic = entry.get("license") or {}
+        name = lic.get("id") or lic.get("name")
+        if name:
+            names.append(name)
+    return list(dict.fromkeys(names))
+
+def is_strong_copyleft(names):
+    for name in names:
+        upper = name.upper()
+        if "GPL" in upper and not upper.startswith("LGPL"):
+            return True
+    return False
+
+def ecosystem(comp):
+    purl = comp.get("purl") or ""
+    if purl.startswith("pkg:"):
+        return purl[4:].split("/", 1)[0]
+    return comp.get("type") or "unknown"
+
+packages, file_entries = [], 0
+for comp in syft_sbom.get("components", []) or []:
+    if not isinstance(comp, dict):
+        continue
+    if comp.get("type") == "file":
+        file_entries += 1
+        continue
+    name = comp.get("name", "")
+    full_name = comp["group"] + "/" + name if comp.get("group") else name
+    ver = comp.get("version", "")
+    counts = (vuln_by_purl.get(comp.get("purl") or "")
+              or vuln_by_nv.get((full_name, ver))
+              or vuln_by_nv.get((name, ver))
+              or {})
+    lic = license_names(comp)
+    packages.append(dict(
+        name=full_name, ver=ver, eco=ecosystem(comp), lic=lic,
+        copyleft=is_strong_copyleft(lic), purl=comp.get("purl") or "",
+        v={s: counts.get(s, 0) for s in SEV_ORDER}))
+packages.sort(key=lambda p: tuple(-p["v"][s] for s in SEV_ORDER) + (p["name"].lower(),))
+
+ecosystems = {}
+for p in packages:
+    ecosystems[p["eco"]] = ecosystems.get(p["eco"], 0) + 1
+
+SYFT_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>__CSS__</style>
+</head>
+<body>
+<div class="wrap">
+<a class="back" href="index.html">&larr; Back to Security Dashboard</a>
+<h1>__TITLE__</h1>
+<p class="sub" id="sub"></p>
+<div class="cards" id="cards"></div>
+
+<h2>Packages</h2>
+<p class="note">Vulnerability counts come from Trivy scanning this Syft SBOM. Strong copyleft licences (GPL, AGPL) are flagged because they matter if you ship code to clients.</p>
+<div class="bar">
+ <input id="q" type="search" placeholder="Search package, licence or PURL" aria-label="Search packages">
+ <select id="eco" aria-label="Ecosystem"><option value="">All ecosystems</option></select>
+ <label><input type="checkbox" id="vonly"> Only vulnerable</label>
+ <label><input type="checkbox" id="conly"> Only copyleft</label>
+ <span class="count" id="count"></span>
+</div>
+<div class="tbl"><table id="list"></table></div>
+<p><a class="dl" href="syft-sbom.cdx.json" download>Download CycloneDX SBOM (JSON)</a><a class="dl" href="syft-packages.txt" download>Download package table (TXT)</a></p>
+</div>
+<script>
+const D = __DATA__;
+const $ = id => document.getElementById(id);
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const SEV = ['CRITICAL','HIGH','MEDIUM','LOW','UNKNOWN'];
+const cap = s => s.charAt(0) + s.slice(1).toLowerCase();
+const P = D.packages;
+const isVuln = p => SEV.some(s => p.v[s] > 0);
+
+$('sub').textContent = `Source: ${D.root || 'unnamed'}${D.rootver ? ' (build ' + D.rootver + ')' : ''}. ${P.length} packages and ${D.files} file entries cataloged by Syft.`;
+$('cards').innerHTML = [[P.length, 'packages'], ...Object.entries(D.eco).map(([e, n]) => [n, e + ' packages']),
+  [P.filter(isVuln).length, 'with known CVEs'], [P.filter(p => p.copyleft).length, 'strong copyleft licences']]
+  .map(([n, l]) => `<div class="card"><b>${n}</b><span>${esc(l)}</span></div>`).join('');
+
+Object.keys(D.eco).sort().forEach(e => { const o = document.createElement('option'); o.value = e; o.textContent = e; $('eco').appendChild(o); });
+
+function vcell(p) {
+  if (!D.scanned) return '<span class="muted">Not scanned</span>';
+  const parts = SEV.filter(s => p.v[s] > 0).map(s => `<span class="pill s-${s.toLowerCase()}">${p.v[s]} ${cap(s)}</span>`);
+  return parts.length ? parts.join('') : '<span class="muted">None</span>';
+}
+function render() {
+  const q = $('q').value.toLowerCase(), eco = $('eco').value, vo = $('vonly').checked, co = $('conly').checked;
+  const rows = P.filter(p => (!eco || p.eco === eco) && (!vo || isVuln(p)) && (!co || p.copyleft)
+    && (!q || (p.name + ' ' + p.purl + ' ' + p.lic.join(' ')).toLowerCase().includes(q)));
+  $('count').textContent = `${rows.length} of ${P.length} shown`;
+  $('list').innerHTML = '<tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Licence</th><th>Vulnerabilities</th><th>PURL</th></tr>'
+    + (rows.length ? rows.map(p => `<tr>
+      <td><code>${esc(p.name)}</code></td><td><code>${esc(p.ver)}</code></td>
+      <td><span class="tag">${esc(p.eco)}</span></td>
+      <td>${p.lic.length ? esc(p.lic.join(', ')) : '<span class="muted">Not declared</span>'}${p.copyleft ? ' <span class="tag warn">copyleft</span>' : ''}</td>
+      <td>${vcell(p)}</td><td class="purl">${esc(p.purl)}</td></tr>`).join('')
+      : '<tr><td colspan="6">No packages match these filters.</td></tr>');
+}
+['q', 'eco', 'vonly', 'conly'].forEach(id => $(id).addEventListener(id === 'q' ? 'input' : 'change', render));
+render();
+</script>
+</body>
+</html>
+"""
+
+syft_payload = dict(
+    packages=packages, files=file_entries, eco=ecosystems, scanned=syft_scan is not None,
+    root=syft_root.get("name", ""), rootver=syft_root.get("version", ""))
+(report_dir / "syft-report.html").write_text(
+    SYFT_TEMPLATE
+    .replace("__CSS__", REPORT_CSS)
+    .replace("__TITLE__", safe("Syft SBOM Packages - Build #" + str(build_number)))
+    .replace("__DATA__", embed(syft_payload)))
+
+# --------------------------------------------------
+# 5. SONARQUBE HTML
+# --------------------------------------------------
+sonar_log = read_text("sonarqube-report.txt")
+sonar_url = "http://103.25.175.146/dashboard?id=Dfos"
+
+sonar_content = f"""
+<h1>SonarQube - SAST Report</h1>
+<p>Project Key: <strong>Dfos</strong></p>
+<p><a href="{sonar_url}" target="_blank">🔗 Open Live SonarQube Dashboard</a></p>
+<h2>Scanner Execution Log</h2>
+<pre>{safe(sonar_log)}</pre>
+"""
+write_html("sonarqube-report.html", "SonarQube Report", sonar_content)
+
+# --------------------------------------------------
+# 6. MAIN CENTRAL DASHBOARD (index.html)
+# --------------------------------------------------
+reports = [
+    ("Semgrep", "semgrep-report.html", "SAST: PHP, JavaScript, OWASP, CWE, injection and secrets rules"),
+    ("Gitleaks", "gitleaks-report.html", "Secret Scanning Results"),
+    ("SonarQube", "sonarqube-report.html", "Static Application Security Testing (SAST)"),
+    ("OWASP ZAP", "zap-dast-report.html", "Dynamic Application Security Testing (DAST)"),
+    ("Trivy", "trivy-report.html", "Vulnerabilities, Misconfigurations & Secrets"),
+    ("Syft SBOM", "syft-report.html", "Package inventory with licences and CVE counts (CycloneDX)"),
+    ("SBOM Vulnerabilities", "sbom-vuln-report.html", "CVEs in Trivy and Syft SBOMs, upgrade plan and gate result")
+]
+
+cards = ""
+for name, filename, description in reports:
+    exists = (report_dir / filename).is_file()
+    link = f'<a href="{safe(filename)}">Open HTML Report →</a>' if exists else '<span style="color:#b91c1c;">Report Not Generated</span>'
+    cards += f"""
+    <div style="background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 6px rgba(0,0,0,0.08);">
+        <h3 style="margin-top:0; color:#172554;">{safe(name)}</h3>
+        <p style="color:#4b5563; font-size:14px;">{safe(description)}</p>
+        {link}
+    </div>
+    """
+
+if gate_status.startswith("PASSED"):
+    gate_color = "#86efac"
+elif gate_status.startswith("FAILED") or gate_status.startswith("ERROR"):
+    gate_color = "#fca5a5"
+else:
+    gate_color = "#fcd34d"
+
+dashboard = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFOS Security Dashboard - #{safe(build_number)}</title>
+<style>
+body {{ font-family: Arial, sans-serif; margin: 0; background: #f3f5f9; color: #202938; }}
+header {{ background: #172554; color: white; padding: 25px 5%; }}
+main {{ max-width: 1100px; margin: 30px auto; padding: 0 20px; }}
+.grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; }}
+a {{ color: #1d4ed8; text-decoration: none; font-weight: bold; }}
+footer {{ margin-top: 40px; color: #64748b; font-size: 13px; text-align: center; }}
+</style>
+</head>
+<body>
+<header>
+    <h1 style="margin:0;">DFOS Security Portal</h1>
+    <p style="margin: 5px 0 0; color:#93c5fd;">Build #{safe(build_number)} | Path: /var/www/html/devsecops-reports/{safe(build_number)}/</p>
+    <p style="margin: 8px 0 0; color:{gate_color}; font-weight:bold;">SBOM security gate: {safe(gate_status)}</p>
+</header>
+<main>
+    <h2>Consolidated Security Reports (All Scans)</h2>
+    <div class="grid">
+        {cards}
+    </div>
+    <footer>
+        Generated on {safe(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))}
+    </footer>
+</main>
+</body>
+</html>
+"""
+(report_dir / "index.html").write_text(dashboard)
+PY
+
+                    chmod -R 755 "$REPORT_DIR" || true
+                    echo "All reports successfully written to $REPORT_DIR"
+
+                    # Also copy to workspace for Jenkins Archiving
+                    mkdir -p "$WORKSPACE/reports"
+                    cp -a "$REPORT_DIR/." "$WORKSPACE/reports/"
+                '''
+
+                archiveArtifacts(
+                    artifacts: 'reports/**/*',
+                    allowEmptyArchive: true
+                )
+
+                // ---- Email HTML reports ----
+                try {
+                    sh '''
+                        cd "$WORKSPACE/reports"
+                        rm -f "$WORKSPACE/devsecops-reports-${BUILD_NUMBER}.zip"
+                        python3 -m zipfile -c "$WORKSPACE/devsecops-reports-${BUILD_NUMBER}.zip" *.html
+                    '''
+
+                    def gate = fileExists('reports/sbom-gate-status.txt') ?
+                        readFile('reports/sbom-gate-status.txt').trim() : 'NOT RUN'
+
+                    emailext(
+                        to: 'amit.kumar@designx.in, shubham.pandey@designx.in, chandrma.verma@designx.in',
+                        from: 'donotreply@designx.in',
+                        subject: "DFOS DevSecOps Reports - Build #${env.BUILD_NUMBER} - ${currentBuild.currentResult}",
+                        mimeType: 'text/html',
+                        attachmentsPattern: "devsecops-reports-${env.BUILD_NUMBER}.zip",
+                        body: """
+                            <p>Hi,</p>
+                            <p>The DFOS QA security scan for <b>Build #${env.BUILD_NUMBER}</b> has completed.</p>
+                            <ul>
+                              <li><b>Build result:</b> ${currentBuild.currentResult}</li>
+                              <li><b>SBOM security gate:</b> ${gate}</li>
+                            </ul>
+                            <p>All HTML reports are attached as a zip file. Extract the zip and open <b>index.html</b>; the other reports can be opened from the dashboard.</p>
+                            <p>Online dashboard: <a href="${env.BUILD_URL}artifact/reports/index.html">${env.BUILD_URL}artifact/reports/index.html</a></p>
+                            <p>— Jenkins</p>
+                        """
+                    )
+                } catch (err) {
+                    echo "Report email failed: ${err}"
+                }
+            }
+        }
+
+        success {
+            echo "All security scans completed successfully."
+            echo "Access your HTML reports at: /var/www/html/devsecops-reports/${BUILD_NUMBER}/index.html"
+        }
+
+        unstable {
+            echo "SBOM security gate found vulnerabilities (warn mode). Review: /var/www/html/devsecops-reports/${BUILD_NUMBER}/sbom-vuln-report.html"
+        }
+
+        failure {
+            echo "One or more stages failed. Check reports at: /var/www/html/devsecops-reports/${BUILD_NUMBER}/index.html"
+        }
+    }
+}
